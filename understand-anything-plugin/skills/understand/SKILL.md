@@ -340,7 +340,17 @@ Dispatch prompt template (fill in batch-specific values from `batches.json[i]`):
 
 **Output naming is per-batchIndex — no fusion.** If you fuse multiple small batches into a single file-analyzer dispatch for token efficiency, the dispatched agent must STILL write one output file per original `batchIndex` using `batch-<batchIndex>.json` or `batch-<batchIndex>-part-<k>.json`. The merge script's regex (`batch-(\d+)(?:-part-(\d+))?\.json`) silently drops any other naming (e.g., `batch-fused-8-13.json`, `batch-8-13.json`), losing every node and edge in that file. After each dispatch returns, verify each `batchIndex` in the dispatched input has a corresponding `batch-<batchIndex>.json` (or `batch-<batchIndex>-part-*.json`) on disk before proceeding to the next dispatch.
 
-After ALL batches complete, report to the user: `Phase 2 complete. All <totalBatches> batches analyzed.`
+After ALL batches complete, run the hard pre-merge validator:
+
+```bash
+node <SKILL_DIR>/validate-batch-outputs.mjs $PROJECT_ROOT
+```
+
+This validator compares `.understand-anything/intermediate/batches.json` with actual `batch-*.json` outputs. If it reports any missing, stale/unexpected, malformed, or non-contiguous part outputs, Phase 2 is incomplete.
+
+**Hard stop:** Do NOT run `merge-batch-graphs.py` after a validator failure. Do NOT continue with a partial graph unless the user explicitly says partial output is acceptable. Retry only the missing/failed batches, or rerun Phase 1.5 with lower `UA_BATCH_MAX_*` limits if the failure was caused by model memory/context limits.
+
+After the validator passes, report to the user: `Phase 2 complete. All <totalBatches> batches analyzed.`
 
 Run the merge-and-normalize script bundled with this skill (located next to this SKILL.md file — use the skill directory path, not the project root):
 ```bash
@@ -808,9 +818,10 @@ Report to the user: `[Phase 7/7] Saving knowledge graph...`
 ## Error Handling
 
 - If any subagent dispatch fails, retry **once** with the same prompt plus additional context about the failure.
+- If a file-analyzer batch fails because the prompt is too large (memory guard, prefill guard, context length, or similar), do NOT retry the same oversized prompt repeatedly. Lower `UA_BATCH_MAX_SOURCE_BYTES`, `UA_BATCH_MAX_LINES`, and/or `UA_BATCH_MAX_FILES`, rerun Phase 1.5, then retry Phase 2.
 - Track all warnings and errors from each phase in a `$PHASE_WARNINGS` list. When using `--review`, pass this list to the graph-reviewer in Phase 6. On the default path, include accumulated warnings in the Phase 7 final report.
-- If it fails a second time, skip that phase and continue with partial results.
-- ALWAYS save partial results — a partial graph is better than no graph.
+- If Phase 2 has missing or invalid batch outputs, stop before merge. A partial graph is allowed only when the user explicitly approves partial output.
+- Save partial intermediate files for debugging/resume, but do not publish or merge them as a complete graph.
 - Report any skipped phases or errors in the final summary so the user knows what happened.
 - NEVER silently drop errors. Every failure must be visible in the final report.
 
