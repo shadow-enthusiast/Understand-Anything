@@ -270,6 +270,26 @@ node <SKILL_DIR>/compute-batches.mjs $PROJECT_ROOT
 
 Reads `.understand-anything/intermediate/scan-result.json`, writes `.understand-anything/intermediate/batches.json`.
 
+For local-model harnesses with strict prefill memory guards (for example MLX/oMLX), reduce per-dispatch prompt size by setting any of:
+
+```bash
+UA_BATCH_MAX_SOURCE_BYTES=80000 \
+UA_BATCH_MAX_LINES=1800 \
+UA_BATCH_MAX_FILES=20 \
+node <SKILL_DIR>/compute-batches.mjs $PROJECT_ROOT
+```
+
+The same values are also accepted as CLI flags:
+
+```bash
+node <SKILL_DIR>/compute-batches.mjs $PROJECT_ROOT \
+  --max-batch-source-bytes=80000 \
+  --max-batch-lines=1800 \
+  --max-batch-files=20
+```
+
+Use lower limits when file-analyzer dispatches fail with local prefill/memory-guard errors.
+
 Capture stderr. Append any line starting with `Warning:` to `$PHASE_WARNINGS` for the final report.
 
 If the script exits non-zero, the failure is hard — relay the full stderr to the user as a Phase 1.5 failure. Do not attempt to recover; the script's internal fallback (count-based) already handles recoverable issues. A non-zero exit means a fundamental problem (missing input file, malformed JSON, etc.).
