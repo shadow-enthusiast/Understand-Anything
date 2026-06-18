@@ -10,9 +10,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = resolve(__dirname, '../../../understand-anything-plugin/skills/understand/compute-batches.mjs');
 const FIXTURES = resolve(__dirname, 'fixtures');
 
-function runScript(projectRoot, extraArgs = []) {
+function runScript(projectRoot, extraArgs = [], extraEnv = {}) {
   return spawnSync('node', [SCRIPT, projectRoot, ...extraArgs], {
     encoding: 'utf-8',
+    env: { ...process.env, ...extraEnv },
   });
 }
 
@@ -105,6 +106,46 @@ describe('compute-batches.mjs — size enforcement', () => {
     expect(sum).toBe(40);
     // Warning was emitted to stderr
     expect(result.stderr).toMatch(/Warning: compute-batches: community size 40 > max 35/);
+  });
+});
+
+describe('compute-batches.mjs — prompt-size budget enforcement', () => {
+  let root;
+
+  afterEach(() => {
+    if (root) rmSync(root, { recursive: true, force: true });
+  });
+
+  it('splits merged singleton batches by line budget', () => {
+    root = mkdtempSync(join(tmpdir(), 'ua-cb-budget-'));
+    mkdirSync(join(root, '.understand-anything', 'intermediate'), { recursive: true });
+    mkdirSync(join(root, 'src'), { recursive: true });
+
+    const files = [];
+    const importMap = {};
+    for (let i = 0; i < 10; i++) {
+      const path = `src/leaf${i}.ts`;
+      writeFileSync(join(root, path), Array(10).fill(`export const leaf${i} = ${i};`).join('\n'));
+      files.push({ path, language: 'typescript', sizeLines: 10, fileCategory: 'code' });
+      importMap[path] = [];
+    }
+
+    writeFileSync(
+      join(root, '.understand-anything', 'intermediate', 'scan-result.json'),
+      JSON.stringify({ files, importMap }, null, 2),
+    );
+
+    const result = runScript(root, [], { UA_BATCH_MAX_LINES: '25' });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toMatch(/prompt-size limits added/);
+
+    const out = readBatches(root);
+    expect(out.totalFiles).toBe(10);
+    expect(out.batches.length).toBe(5);
+    for (const batch of out.batches) {
+      const lines = batch.files.reduce((sum, f) => sum + f.sizeLines, 0);
+      expect(lines).toBeLessThanOrEqual(25);
+    }
   });
 });
 

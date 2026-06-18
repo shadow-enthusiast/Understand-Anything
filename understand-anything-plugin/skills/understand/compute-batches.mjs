@@ -7,12 +7,17 @@
  *
  * Usage:
  *   node compute-batches.mjs <project-root> [--changed-files=<path>]
+ *   node compute-batches.mjs <project-root> \
+ *     [--max-batch-files=N] [--max-batch-lines=N] [--max-batch-source-bytes=N]
+ *
+ * Budget env fallbacks:
+ *   UA_BATCH_MAX_FILES, UA_BATCH_MAX_LINES, UA_BATCH_MAX_SOURCE_BYTES
  *
  * Input:  <project-root>/.understand-anything/intermediate/scan-result.json
  * Output: <project-root>/.understand-anything/intermediate/batches.json
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,6 +30,12 @@ import { createRequire } from 'node:module';
  * around tens of MB even when the average file is ~10 KB.
  */
 const IO_PARALLELISM = 64;
+
+const DEFAULT_BATCH_LIMITS = {
+  maxFiles: 35,
+  maxLines: 3000,
+  maxSourceBytes: 120_000,
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = resolve(dirname(__filename), '../..');
@@ -261,6 +272,146 @@ function countBasedAssignment(codeFiles, batchSize = 12) {
   return out;
 }
 
+function parsePositiveIntOption(value, name, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) {
+    process.stderr.write(
+      `Warning: compute-batches: invalid ${name}=${value}; using ${fallback}\n`,
+    );
+    return fallback;
+  }
+  return n;
+}
+
+function parseBatchLimits(args) {
+  const cli = {};
+  for (const arg of args) {
+    const m = arg.match(/^--(max-batch-files|max-batch-lines|max-batch-source-bytes)=(.+)$/);
+    if (!m) continue;
+    cli[m[1]] = m[2];
+  }
+
+  return {
+    maxFiles: parsePositiveIntOption(
+      cli['max-batch-files'] ?? process.env.UA_BATCH_MAX_FILES,
+      'max batch files',
+      DEFAULT_BATCH_LIMITS.maxFiles,
+    ),
+    maxLines: parsePositiveIntOption(
+      cli['max-batch-lines'] ?? process.env.UA_BATCH_MAX_LINES,
+      'max batch lines',
+      DEFAULT_BATCH_LIMITS.maxLines,
+    ),
+    maxSourceBytes: parsePositiveIntOption(
+      cli['max-batch-source-bytes'] ?? process.env.UA_BATCH_MAX_SOURCE_BYTES,
+      'max batch source bytes',
+      DEFAULT_BATCH_LIMITS.maxSourceBytes,
+    ),
+  };
+}
+
+function sourceBytesForFile(projectRoot, file) {
+  try {
+    return statSync(join(projectRoot, file.path)).size;
+  } catch {
+    // Missing/unreadable files will be reported later by file-analyzer. Keep
+    // batching deterministic and estimate from line count here.
+    return (file.sizeLines || 0) * 80;
+  }
+}
+
+function fileCost(projectRoot, file) {
+  return {
+    files: 1,
+    lines: file.sizeLines || 0,
+    sourceBytes: sourceBytesForFile(projectRoot, file),
+  };
+}
+
+function exceedsLimits(total, limits) {
+  return total.files > limits.maxFiles
+    || total.lines > limits.maxLines
+    || total.sourceBytes > limits.maxSourceBytes;
+}
+
+function addCost(a, b) {
+  return {
+    files: a.files + b.files,
+    lines: a.lines + b.lines,
+    sourceBytes: a.sourceBytes + b.sourceBytes,
+  };
+}
+
+function zeroCost() {
+  return { files: 0, lines: 0, sourceBytes: 0 };
+}
+
+function splitFilesByLimits(projectRoot, files, limits) {
+  const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
+  const parts = [];
+  let current = [];
+  let currentCost = zeroCost();
+
+  for (const file of sorted) {
+    const cost = fileCost(projectRoot, file);
+    const candidateCost = addCost(currentCost, cost);
+    if (current.length > 0 && exceedsLimits(candidateCost, limits)) {
+      parts.push(current);
+      current = [];
+      currentCost = zeroCost();
+    }
+    current.push(file);
+    currentCost = addCost(currentCost, cost);
+
+    if (current.length === 1 && exceedsLimits(currentCost, limits)) {
+      process.stderr.write(
+        `Warning: compute-batches: ${file.path} alone exceeds batch limits ` +
+        `(lines=${currentCost.lines}/${limits.maxLines}, ` +
+        `sourceBytes=${currentCost.sourceBytes}/${limits.maxSourceBytes}) ` +
+        `— keeping it as a single-file batch\n`,
+      );
+      parts.push(current);
+      current = [];
+      currentCost = zeroCost();
+    }
+  }
+
+  if (current.length) parts.push(current);
+  return parts;
+}
+
+function enforceBatchLimits(batches, projectRoot, limits) {
+  const out = [];
+  let splitCount = 0;
+
+  for (const b of batches) {
+    const parts = splitFilesByLimits(projectRoot, b.files, limits);
+    if (parts.length > 1) {
+      splitCount += parts.length - 1;
+      process.stderr.write(
+        `Info: compute-batches: split batch ${b.batchIndex} into ${parts.length} parts ` +
+        `to stay within limits ` +
+        `(maxFiles=${limits.maxFiles}, maxLines=${limits.maxLines}, ` +
+        `maxSourceBytes=${limits.maxSourceBytes})\n`,
+      );
+    }
+    for (const files of parts) out.push({ files });
+  }
+
+  if (splitCount > 0) {
+    process.stderr.write(
+      `Info: compute-batches: prompt-size limits added ${splitCount} batch splits ` +
+      `— tune with UA_BATCH_MAX_LINES, UA_BATCH_MAX_SOURCE_BYTES, UA_BATCH_MAX_FILES\n`,
+    );
+  }
+
+  return out.map((b, i) => ({
+    batchIndex: i + 1,
+    files: b.files,
+  }));
+}
+
 /**
  * Pool small mergeable batches into "misc" batches to reduce dispatch overhead.
  * Preserves semantic groupings (non-code Groups A-D, marked `mergeable=false`)
@@ -339,8 +490,10 @@ async function main() {
     process.exit(1);
   }
 
+  const extraArgs = process.argv.slice(3);
+  const batchLimits = parseBatchLimits(extraArgs);
   let changedFiles = null;
-  for (const arg of process.argv.slice(3)) {
+  for (const arg of extraArgs) {
     const m = arg.match(/^--changed-files=(.+)$/);
     if (m) {
       const p = m[1];
@@ -458,7 +611,8 @@ async function main() {
   }));
   const bareBatches = [...codeBatchObjsBare, ...nonCodeBatchObjsBare];
   const mergedBareBatches = mergeSmallBatches(bareBatches);
-  const batchOf = buildBatchOfMap(mergedBareBatches);
+  const budgetedBareBatches = enforceBatchLimits(mergedBareBatches, projectRoot, batchLimits);
+  const batchOf = buildBatchOfMap(budgetedBareBatches);
 
   // Build reverse import map: target → [sources that import target]
   const reverseImportMap = new Map();
@@ -481,7 +635,7 @@ async function main() {
   const MAX_NEIGHBORS = 50;
 
   // Second-pass: enrich each batch with batchImportData + neighborMap
-  const batches = mergedBareBatches.map(b => {
+  const batches = budgetedBareBatches.map(b => {
     const batchPaths = new Set(b.files.map(f => f.path));
     const batchImportData = {};
     const neighborMap = {};
